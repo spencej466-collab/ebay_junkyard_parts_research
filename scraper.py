@@ -1,12 +1,11 @@
-# scraper.py
+# app.py
 
 import base64
 import json
 import os
 import sqlite3
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List
 
 import pandas as pd
 import requests
@@ -14,7 +13,6 @@ import streamlit as st
 import truststore
 
 # Use the Windows system certificate store.
-# This is especially useful on corporate-managed PCs.
 truststore.inject_into_ssl()
 
 
@@ -27,7 +25,6 @@ DB_PATH = "ebay_research.db"
 # Production
 SANDBOX = False
 
-# eBay US marketplace
 MARKETPLACE_ID = "EBAY_US"
 
 API_ROOT = (
@@ -41,28 +38,8 @@ SEARCH_URL = f"{API_ROOT}/buy/browse/v1/item_summary/search"
 
 SCOPES = "https://api.ebay.com/oauth/api_scope"
 
-# Browse API page size.
-# eBay can change the maximum page size, so the pagination logic below
-# follows the response's "next" link instead of assuming a fixed size.
 PAGE_SIZE = 200
-
-# Application safety limit.
 MAX_LISTINGS = 1000
-
-# Transient HTTP status codes that are safe to retry.
-RETRYABLE_STATUS_CODES = {
-    429,  # Too Many Requests
-    500,  # Internal Server Error
-    502,  # Bad Gateway
-    503,  # Service Unavailable
-    504,  # Gateway Timeout
-}
-
-# Maximum retry attempts after the initial request.
-MAX_RETRIES = 2
-
-# Initial delay between retries.
-INITIAL_RETRY_DELAY = 1.0
 
 
 # =============================================================================
@@ -107,219 +84,29 @@ def init_db() -> None:
         """
     )
 
-    # -------------------------------------------------------------------------
-    # Upgrade older versions of the database.
-    # -------------------------------------------------------------------------
-
-    cur.execute("PRAGMA table_info(active_items)")
-
-    existing_columns = {
-        row[1]
-        for row in cur.fetchall()
-    }
-
-    migrations = {
-        "shipping_cost":
-            "ALTER TABLE active_items ADD COLUMN shipping_cost REAL",
-
-        "total_price":
-            "ALTER TABLE active_items ADD COLUMN total_price REAL",
-
-        "item_location":
-            "ALTER TABLE active_items ADD COLUMN item_location TEXT",
-
-        "buying_options":
-            "ALTER TABLE active_items ADD COLUMN buying_options TEXT",
-    }
-
-    for column_name, sql in migrations.items():
-
-        if column_name not in existing_columns:
-            cur.execute(sql)
-
     conn.commit()
     conn.close()
 
 
 # =============================================================================
-# Credentials
+# eBay Authentication
 # =============================================================================
 
-def get_secret(name: str) -> str:
-    """
-    Read a secret from Streamlit Secrets first, then fall back to
-    environment variables for local development.
-    """
-
-    value = ""
-
-    try:
-        value = st.secrets.get(name, "")
-    except Exception:
-        value = ""
-
-    if value:
-        return str(value).strip()
-
-    return os.getenv(name, "").strip()
-
-
 def get_credentials() -> tuple[str, str]:
-
-    client_id = get_secret("EBAY_CLIENT_ID")
-    client_secret = get_secret("EBAY_CLIENT_SECRET")
+    client_id = os.getenv("EBAY_CLIENT_ID", "").strip()
+    client_secret = os.getenv("EBAY_CLIENT_SECRET", "").strip()
 
     if not client_id or not client_secret:
-
         raise RuntimeError(
-            "eBay credentials are not configured. "
-            "Add EBAY_CLIENT_ID and EBAY_CLIENT_SECRET "
-            "to Streamlit Secrets."
+            "Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET "
+            "in your PowerShell environment."
         )
 
     return client_id, client_secret
 
 
-# =============================================================================
-# HTTP Helpers
-# =============================================================================
-
-def format_error_response(
-    response: requests.Response,
-) -> str:
-    """
-    Extract a useful, user-readable error message from an eBay response.
-    """
-
-    status = response.status_code
-
-    try:
-        payload = response.json()
-
-        errors = payload.get("errors")
-
-        if errors:
-
-            messages = []
-
-            for error in errors:
-
-                error_id = error.get("errorId", "")
-                message = error.get("message", "")
-                long_message = error.get("longMessage", "")
-
-                parts = [
-                    str(x).strip()
-                    for x in [
-                        error_id,
-                        message,
-                        long_message,
-                    ]
-                    if x
-                ]
-
-                if parts:
-                    messages.append(" - ".join(parts))
-
-            if messages:
-                return (
-                    f"HTTP {status}: "
-                    + " | ".join(messages)
-                )
-
-        if "message" in payload:
-            return f"HTTP {status}: {payload['message']}"
-
-        return f"HTTP {status}: {json.dumps(payload)}"
-
-    except Exception:
-
-        text = response.text.strip()
-
-        if text:
-            return f"HTTP {status}: {text[:1000]}"
-
-        return f"HTTP {status}"
-
-
-def request_with_retry(
-    method: str,
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    data: Optional[Dict[str, Any]] = None,
-    timeout: int = 30,
-) -> requests.Response:
-    """
-    Execute an HTTP request with up to MAX_RETRIES retries for transient
-    eBay/service errors.
-
-    Retry sequence:
-        initial attempt
-        retry 1
-        retry 2
-
-    Uses exponential backoff and honors Retry-After when supplied.
-    """
-
-    last_response: Optional[requests.Response] = None
-
-    for attempt in range(MAX_RETRIES + 1):
-
-        try:
-
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                data=data,
-                timeout=timeout,
-            )
-
-        except requests.RequestException:
-
-            if attempt >= MAX_RETRIES:
-                raise
-
-            delay = INITIAL_RETRY_DELAY * (2 ** attempt)
-            time.sleep(delay)
-
-            continue
-
-        last_response = response
-
-        if response.status_code not in RETRYABLE_STATUS_CODES:
-            return response
-
-        if attempt >= MAX_RETRIES:
-            return response
-
-        retry_after = response.headers.get("Retry-After")
-
-        try:
-            delay = float(retry_after)
-        except (TypeError, ValueError):
-            delay = INITIAL_RETRY_DELAY * (2 ** attempt)
-
-        time.sleep(delay)
-
-    if last_response is not None:
-        return last_response
-
-    raise RuntimeError(
-        "HTTP request failed without receiving a response."
-    )
-
-
-# =============================================================================
-# OAuth
-# =============================================================================
-
 @st.cache_data(ttl=3500, show_spinner=False)
 def get_app_token() -> str:
-
     client_id, client_secret = get_credentials()
 
     auth = base64.b64encode(
@@ -336,32 +123,23 @@ def get_app_token() -> str:
         "scope": SCOPES,
     }
 
-    response = request_with_retry(
-        "POST",
+    response = requests.post(
         TOKEN_URL,
         headers=headers,
         data=data,
         timeout=30,
     )
 
-    if not response.ok:
-
-        raise RuntimeError(
-            "Unable to obtain an eBay application access token.\n\n"
-            + format_error_response(response)
-        )
+    response.raise_for_status()
 
     payload = response.json()
 
-    token = payload.get("access_token")
-
-    if not token:
-
+    if "access_token" not in payload:
         raise RuntimeError(
-            "eBay returned a successful response but no access_token."
+            f"eBay token response did not contain an access_token: {payload}"
         )
 
-    return token
+    return payload["access_token"]
 
 
 # =============================================================================
@@ -393,7 +171,7 @@ def build_search_query(
 
 
 # =============================================================================
-# Browse API
+# eBay Browse API
 # =============================================================================
 
 def search_active_listings(
@@ -411,74 +189,51 @@ def search_active_listings(
 
     all_items: List[Dict[str, Any]] = []
 
-    next_url: Optional[str] = SEARCH_URL
-    params: Optional[Dict[str, Any]] = {
-        "q": query,
-        "limit": min(PAGE_SIZE, max_listings),
-        "offset": 0,
-    }
+    offset = 0
+    total_available = None
 
-    if used_only:
+    while len(all_items) < max_listings:
 
-        params["filter"] = "conditionIds:{3000}"
+        remaining = max_listings - len(all_items)
+        current_limit = min(PAGE_SIZE, remaining)
 
-    total_available: Optional[int] = None
+        params = {
+            "q": query,
+            "limit": current_limit,
+            "offset": offset,
+        }
 
-    while next_url and len(all_items) < max_listings:
+        if used_only:
+            params["filter"] = "conditionIds:{3000}"
 
-        response = request_with_retry(
-            "GET",
-            next_url,
+        response = requests.get(
+            SEARCH_URL,
             headers=headers,
             params=params,
             timeout=30,
         )
 
-        if not response.ok:
-
-            raise RuntimeError(
-                "eBay Browse API request failed.\n\n"
-                + format_error_response(response)
-            )
+        response.raise_for_status()
 
         payload = response.json()
 
+        page_items = payload.get("itemSummaries", []) or []
+
         if total_available is None:
-
-            raw_total = payload.get("total", 0)
-
-            try:
-                total_available = int(raw_total)
-            except (TypeError, ValueError):
-                total_available = 0
-
-        page_items = payload.get(
-            "itemSummaries",
-            [],
-        ) or []
+            total_available = payload.get("total", 0)
 
         if not page_items:
             break
 
-        remaining = max_listings - len(all_items)
+        all_items.extend(page_items)
 
-        all_items.extend(
-            page_items[:remaining]
-        )
+        offset += len(page_items)
 
-        # ---------------------------------------------------------------------
-        # eBay provides a "next" link when another page exists.
-        #
-        # We deliberately follow it instead of calculating pagination
-        # ourselves from "total". eBay specifically recommends this because
-        # the page size and result counts can change.
-        # ---------------------------------------------------------------------
+        if offset >= total_available:
+            break
 
-        next_url = payload.get("next")
-
-        # Once we follow a fully constructed "next" URL, we must not send
-        # the original search parameters again.
-        params = None
+        if len(page_items) < current_limit:
+            break
 
     return {
         "itemSummaries": all_items,
@@ -487,62 +242,32 @@ def search_active_listings(
 
 
 # =============================================================================
-# Active Listing Normalization
+# Normalize Active Listings
 # =============================================================================
 
-def extract_shipping_cost(
-    item: Dict[str, Any],
-) -> float:
+def extract_shipping_cost(item: Dict[str, Any]) -> float:
 
-    shipping_options = item.get(
-        "shippingOptions"
-    ) or []
+    shipping_options = item.get("shippingOptions") or []
 
     if not shipping_options:
         return 0.0
 
     first_option = shipping_options[0] or {}
-
-    shipping_cost = first_option.get(
-        "shippingCost"
-    ) or {}
+    shipping_cost = first_option.get("shippingCost") or {}
 
     try:
-
-        return float(
-            shipping_cost.get(
-                "value",
-                0,
-            ) or 0
-        )
-
+        return float(shipping_cost.get("value", 0) or 0)
     except (TypeError, ValueError):
-
         return 0.0
 
 
-def extract_location(
-    item: Dict[str, Any],
-) -> str:
+def extract_location(item: Dict[str, Any]) -> str:
 
-    location = item.get(
-        "itemLocation"
-    ) or {}
+    location = item.get("itemLocation") or {}
 
-    city = location.get(
-        "city",
-        "",
-    )
-
-    state = location.get(
-        "stateOrProvince",
-        "",
-    )
-
-    postal_code = location.get(
-        "postalCode",
-        "",
-    )
+    city = location.get("city", "")
+    state = location.get("stateOrProvince", "")
+    postal_code = location.get("postalCode", "")
 
     pieces = [
         str(city).strip(),
@@ -550,93 +275,49 @@ def extract_location(
         str(postal_code).strip(),
     ]
 
-    return ", ".join(
-        x for x in pieces if x
-    )
+    return ", ".join(x for x in pieces if x)
 
 
 def flatten_items(
-    payload: Dict[str, Any],
+    payload: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
 
-    items = payload.get(
-        "itemSummaries",
-        [],
-    ) or []
+    items = payload.get("itemSummaries", []) or []
 
     rows: List[Dict[str, Any]] = []
 
     for item in items:
 
-        price = item.get(
-            "price"
-        ) or {}
+        price = item.get("price") or {}
+        seller = item.get("seller") or {}
 
-        seller = item.get(
-            "seller"
-        ) or {}
-
-        condition = item.get(
-            "condition",
-            "",
-        )
+        condition = item.get("condition") or ""
 
         try:
-
-            item_price = float(
-                price.get(
-                    "value",
-                    0,
-                ) or 0
-            )
-
+            item_price = float(price.get("value", 0) or 0)
         except (TypeError, ValueError):
-
             item_price = 0.0
 
-        shipping_cost = extract_shipping_cost(
-            item
-        )
+        shipping_cost = extract_shipping_cost(item)
 
-        total_price = (
-            item_price +
-            shipping_cost
-        )
+        total_price = item_price + shipping_cost
 
-        buying_options = item.get(
-            "buyingOptions"
-        ) or []
+        buying_options = item.get("buyingOptions") or []
 
         rows.append(
             {
-                "item_id": item.get(
-                    "itemId"
-                ),
-                "title": item.get(
-                    "title"
-                ),
+                "item_id": item.get("itemId"),
+                "title": item.get("title"),
                 "price": item_price,
                 "shipping_cost": shipping_cost,
                 "total_price": total_price,
-                "currency": price.get(
-                    "currency"
-                ),
+                "currency": price.get("currency"),
                 "condition_text": condition,
-                "item_location": extract_location(
-                    item
-                ),
-                "buying_options": ", ".join(
-                    buying_options
-                ),
-                "item_web_url": item.get(
-                    "itemWebUrl"
-                ),
-                "seller_username": seller.get(
-                    "username"
-                ),
-                "raw_json": json.dumps(
-                    item
-                ),
+                "item_location": extract_location(item),
+                "buying_options": ", ".join(buying_options),
+                "item_web_url": item.get("itemWebUrl"),
+                "seller_username": seller.get("username"),
+                "raw_json": json.dumps(item),
             }
         )
 
@@ -652,15 +333,10 @@ def save_search_and_items(
     rows: List[Dict[str, Any]],
 ) -> int:
 
-    conn = sqlite3.connect(
-        DB_PATH
-    )
-
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    created_at = datetime.now(
-        timezone.utc
-    ).isoformat()
+    created_at = datetime.now(timezone.utc).isoformat()
 
     cur.execute(
         """
@@ -727,14 +403,12 @@ def save_search_and_items(
 
 
 # =============================================================================
-# Load Recent Results
+# Load Active Results
 # =============================================================================
 
 def load_recent_results() -> pd.DataFrame:
 
-    conn = sqlite3.connect(
-        DB_PATH
-    )
+    conn = sqlite3.connect(DB_PATH)
 
     df = pd.read_sql_query(
         """
@@ -766,60 +440,280 @@ def load_recent_results() -> pd.DataFrame:
 
 
 # =============================================================================
-# Analytics
+# Sold CSV Processing
 # =============================================================================
 
-def summarize_results(
-    df: pd.DataFrame,
+def guess_column(
+    columns: List[str],
+    keywords: List[str],
+) -> str:
+
+    lowered = {
+        column: column.lower().strip()
+        for column in columns
+    }
+
+    for keyword in keywords:
+
+        for original, lower in lowered.items():
+
+            if keyword in lower:
+                return original
+
+    return columns[0] if columns else ""
+
+
+def process_sold_csv(
+    uploaded_file,
+) -> pd.DataFrame:
+
+    try:
+        sold_df = pd.read_csv(uploaded_file)
+    except Exception as ex:
+        raise RuntimeError(
+            f"Could not read the CSV file: {ex}"
+        )
+
+    if sold_df.empty:
+        raise RuntimeError(
+            "The uploaded CSV contains no rows."
+        )
+
+    columns = sold_df.columns.tolist()
+
+    st.write("Detected columns:")
+    st.write(columns)
+
+    st.markdown("### Map Sold Data Columns")
+
+    price_guess = guess_column(
+        columns,
+        [
+            "sold price",
+            "sale price",
+            "price",
+            "sold",
+            "amount",
+        ],
+    )
+
+    date_guess = guess_column(
+        columns,
+        [
+            "sold date",
+            "sale date",
+            "date sold",
+            "date",
+        ],
+    )
+
+    title_guess = guess_column(
+        columns,
+        [
+            "title",
+            "item title",
+            "listing title",
+            "item",
+        ],
+    )
+
+    price_column = st.selectbox(
+        "Sold price column",
+        options=columns,
+        index=columns.index(price_guess),
+    )
+
+    date_column = st.selectbox(
+        "Sold date column",
+        options=columns,
+        index=columns.index(date_guess),
+    )
+
+    title_column = st.selectbox(
+        "Title column",
+        options=columns,
+        index=columns.index(title_guess),
+    )
+
+    sold_df["sold_price"] = (
+        sold_df[price_column]
+        .astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+
+    sold_df["sold_price"] = pd.to_numeric(
+        sold_df["sold_price"],
+        errors="coerce",
+    )
+
+    sold_df["sold_date"] = pd.to_datetime(
+        sold_df[date_column],
+        errors="coerce",
+    )
+
+    sold_df["sold_title"] = (
+        sold_df[title_column]
+        .astype(str)
+        .str.strip()
+    )
+
+    sold_df = sold_df.dropna(
+        subset=["sold_price"]
+    )
+
+    # -------------------------------------------------------------------------
+    # 90-day filter
+    # -------------------------------------------------------------------------
+
+    today = pd.Timestamp.now().normalize()
+    cutoff = today - pd.Timedelta(days=90)
+
+    sold_df = sold_df[
+        sold_df["sold_date"].isna()
+        | (sold_df["sold_date"] >= cutoff)
+    ].copy()
+
+    # Remove obvious zero/negative prices.
+    sold_df = sold_df[
+        sold_df["sold_price"] > 0
+    ]
+
+    return sold_df
+
+
+# =============================================================================
+# Sold Metrics
+# =============================================================================
+
+def calculate_sold_metrics(
+    sold_df: pd.DataFrame,
 ) -> Dict[str, Any]:
 
-    if df.empty:
+    if sold_df is None or sold_df.empty:
 
         return {
-            "count": 0,
-            "median_price": None,
-            "mean_price": None,
-            "max_price": None,
-            "median_total": None,
+            "sold_count": 0,
+            "median_sold_price": None,
+            "average_sold_price": None,
+            "min_sold_price": None,
+            "max_sold_price": None,
         }
 
     prices = pd.to_numeric(
-        df["price"],
+        sold_df["sold_price"],
         errors="coerce",
     ).dropna()
 
-    totals = pd.to_numeric(
-        df["total_price"],
-        errors="coerce",
-    ).dropna()
+    if prices.empty:
+
+        return {
+            "sold_count": 0,
+            "median_sold_price": None,
+            "average_sold_price": None,
+            "min_sold_price": None,
+            "max_sold_price": None,
+        }
 
     return {
-        "count": int(len(df)),
-        "median_price": (
-            float(prices.median())
-            if not prices.empty
-            else None
-        ),
-        "mean_price": (
-            float(prices.mean())
-            if not prices.empty
-            else None
-        ),
-        "max_price": (
-            float(prices.max())
-            if not prices.empty
-            else None
-        ),
-        "median_total": (
-            float(totals.median())
-            if not totals.empty
-            else None
-        ),
+        "sold_count": int(len(prices)),
+        "median_sold_price": float(prices.median()),
+        "average_sold_price": float(prices.mean()),
+        "min_sold_price": float(prices.min()),
+        "max_sold_price": float(prices.max()),
     }
 
 
 # =============================================================================
-# Streamlit UI
+# Combined Metrics
+# =============================================================================
+
+def calculate_market_metrics(
+    active_df: pd.DataFrame,
+    sold_df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    active_count = (
+        len(active_df)
+        if active_df is not None
+        else 0
+    )
+
+    sold_metrics = calculate_sold_metrics(
+        sold_df
+    )
+
+    sold_count = sold_metrics["sold_count"]
+
+    # This is an estimate using 90-day sold volume
+    # against current active inventory.
+    #
+    # It is NOT intended to reproduce eBay's internal
+    # Terapeak methodology exactly.
+    if sold_count + active_count > 0:
+
+        estimated_str = (
+            sold_count /
+            (sold_count + active_count)
+        )
+
+    else:
+        estimated_str = 0.0
+
+    return {
+        "active_count": active_count,
+        "sold_count": sold_count,
+        "estimated_str": estimated_str,
+        **sold_metrics,
+    }
+
+
+# =============================================================================
+# Simple Pick Score
+# =============================================================================
+
+def calculate_pick_score(
+    metrics: Dict[str, Any],
+) -> float:
+
+    active_count = metrics["active_count"]
+    sold_count = metrics["sold_count"]
+    median_price = metrics["median_sold_price"]
+    estimated_str = metrics["estimated_str"]
+
+    if sold_count == 0 or median_price is None:
+        return 0.0
+
+    # Demand component
+    demand_score = min(
+        sold_count * 2,
+        50,
+    )
+
+    # Sell-through component
+    str_score = estimated_str * 30
+
+    # Value component
+    value_score = min(
+        median_price / 10,
+        20,
+    )
+
+    score = (
+        demand_score +
+        str_score +
+        value_score
+    )
+
+    return round(
+        min(score, 100),
+        1,
+    )
+
+
+# =============================================================================
+# Streamlit App
 # =============================================================================
 
 def main() -> None:
@@ -831,13 +725,11 @@ def main() -> None:
 
     init_db()
 
-    st.title(
-        "eBay Parts Research"
-    )
+    st.title("eBay Parts Research")
 
     st.caption(
-        "Research active used eBay listings "
-        "for automotive salvage sourcing."
+        "Research active and recently sold eBay listings "
+        "for junkyard parts sourcing."
     )
 
     # =========================================================================
@@ -871,9 +763,7 @@ def main() -> None:
 
         st.divider()
 
-        st.header(
-            "Active Listing Search"
-        )
+        st.header("Active Listing Search")
 
         used_only = st.checkbox(
             "Used listings only",
@@ -895,7 +785,7 @@ def main() -> None:
         )
 
     # =========================================================================
-    # Search
+    # Search eBay
     # =========================================================================
 
     if search_button:
@@ -910,8 +800,7 @@ def main() -> None:
         if not query:
 
             st.error(
-                "Enter at least one vehicle or part "
-                "search field."
+                "Enter at least one vehicle or part search field."
             )
 
         else:
@@ -928,15 +817,12 @@ def main() -> None:
                         used_only=used_only,
                     )
 
-                    rows = flatten_items(
-                        payload
-                    )
+                    rows = flatten_items(payload)
 
                     if not rows:
 
                         st.warning(
-                            "No active listings "
-                            "were returned."
+                            "No active listings were returned."
                         )
 
                     else:
@@ -946,21 +832,11 @@ def main() -> None:
                             rows=rows,
                         )
 
-                        df = pd.DataFrame(
-                            rows
-                        )
+                        df = pd.DataFrame(rows)
 
-                        st.session_state[
-                            "latest_df"
-                        ] = df
-
-                        st.session_state[
-                            "latest_query"
-                        ] = query
-
-                        st.session_state[
-                            "latest_total"
-                        ] = payload.get(
+                        st.session_state["latest_df"] = df
+                        st.session_state["latest_query"] = query
+                        st.session_state["latest_total"] = payload.get(
                             "total",
                             len(rows),
                         )
@@ -970,42 +846,95 @@ def main() -> None:
                             "active listings."
                         )
 
-            except RuntimeError as ex:
+            except requests.HTTPError as ex:
+
+                response_text = ""
+
+                if ex.response is not None:
+                    response_text = ex.response.text
 
                 st.error(
-                    str(ex)
-                )
-
-            except requests.RequestException as ex:
-
-                st.error(
-                    "Unable to reach eBay. "
-                    "Please try again.\n\n"
-                    f"Technical detail: {ex}"
+                    f"eBay API error: {ex}\n\n"
+                    f"{response_text}"
                 )
 
             except Exception as ex:
 
                 st.error(
-                    f"Unexpected application error: {ex}"
+                    f"Search failed: {ex}"
                 )
 
     # =========================================================================
-    # Results
+    # Active Data
     # =========================================================================
 
-    df = st.session_state.get(
+    active_df = st.session_state.get(
         "latest_df"
     )
 
-    if df is None or df.empty:
+    if active_df is None or active_df.empty:
 
-        df = load_recent_results()
+        active_df = load_recent_results()
 
-    if df is not None and not df.empty:
+    # =========================================================================
+    # Sold Data Upload
+    # =========================================================================
 
-        summary = summarize_results(
-            df
+    st.sidebar.divider()
+
+    st.sidebar.header("Sold Data")
+
+    sold_file = st.sidebar.file_uploader(
+        "Upload sold listings CSV",
+        type=["csv"],
+        help=(
+            "Upload a CSV containing sold listings for the "
+            "same vehicle/part search."
+        ),
+    )
+
+    sold_df = None
+
+    if sold_file is not None:
+
+        try:
+
+            sold_df = process_sold_csv(
+                sold_file
+            )
+
+            st.session_state["sold_df"] = sold_df
+
+            st.sidebar.success(
+                f"{len(sold_df):,} sold records loaded."
+            )
+
+        except Exception as ex:
+
+            st.sidebar.error(
+                f"Sold data error: {ex}"
+            )
+
+    elif "sold_df" in st.session_state:
+
+        sold_df = st.session_state["sold_df"]
+
+    # =========================================================================
+    # Combined Metrics
+    # =========================================================================
+
+    if (
+        active_df is not None
+        and not active_df.empty
+    ):
+
+        metrics = calculate_market_metrics(
+            active_df,
+            sold_df,
+        )
+
+        pick_score = calculate_pick_score(
+            metrics
         )
 
         # ---------------------------------------------------------------------
@@ -1021,71 +950,113 @@ def main() -> None:
 
             total_available = st.session_state.get(
                 "latest_total",
-                len(df),
+                len(active_df),
             )
 
             st.info(
                 f"Search: **{latest_query}** | "
                 f"eBay reports approximately "
-                f"**{total_available:,}** "
-                f"matching active listings. "
-                f"Retrieved **{len(df):,}**."
+                f"**{total_available:,}** active matches. "
+                f"We retrieved **{len(active_df):,}**."
             )
 
         # ---------------------------------------------------------------------
-        # Metrics
+        # Market Metrics
         # ---------------------------------------------------------------------
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        st.subheader("Market Metrics")
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
 
         c1.metric(
-            "Listings",
-            f"{summary['count']:,}",
+            "Active",
+            f"{metrics['active_count']:,}",
         )
 
         c2.metric(
-            "Median Price",
-            (
-                f"${summary['median_price']:.2f}"
-                if summary["median_price"] is not None
-                else "n/a"
-            ),
+            "Sold 90d",
+            f"{metrics['sold_count']:,}",
         )
 
         c3.metric(
-            "Average Price",
-            (
-                f"${summary['mean_price']:.2f}"
-                if summary["mean_price"] is not None
-                else "n/a"
-            ),
+            "Estimated STR",
+            f"{metrics['estimated_str']:.1%}",
         )
 
         c4.metric(
-            "Max Price",
+            "Median Sold",
             (
-                f"${summary['max_price']:.2f}"
-                if summary["max_price"] is not None
+                f"${metrics['median_sold_price']:.2f}"
+                if metrics["median_sold_price"] is not None
                 else "n/a"
             ),
         )
 
         c5.metric(
-            "Median + Shipping",
+            "Average Sold",
             (
-                f"${summary['median_total']:.2f}"
-                if summary["median_total"] is not None
+                f"${metrics['average_sold_price']:.2f}"
+                if metrics["average_sold_price"] is not None
                 else "n/a"
             ),
         )
 
+        c6.metric(
+            "Pick Score",
+            f"{pick_score:.1f}",
+        )
+
         # ---------------------------------------------------------------------
-        # Results
+        # Sold Summary
         # ---------------------------------------------------------------------
 
-        st.subheader(
-            "Active Listings"
-        )
+        if sold_df is not None and not sold_df.empty:
+
+            st.subheader("Sold Listings")
+
+            sold_display = sold_df[
+                [
+                    "sold_title",
+                    "sold_price",
+                    "sold_date",
+                ]
+            ].copy()
+
+            sold_display = sold_display.rename(
+                columns={
+                    "sold_title": "Title",
+                    "sold_price": "Sold Price",
+                    "sold_date": "Sold Date",
+                }
+            )
+
+            st.dataframe(
+                sold_display,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Sold Price": st.column_config.NumberColumn(
+                        "Sold Price",
+                        format="$%.2f",
+                    ),
+                    "Sold Date": st.column_config.DatetimeColumn(
+                        "Sold Date",
+                    ),
+                },
+            )
+
+        else:
+
+            st.warning(
+                "No sold data loaded. Upload a CSV in the sidebar "
+                "to calculate sold metrics."
+            )
+
+        # ---------------------------------------------------------------------
+        # Active Listings
+        # ---------------------------------------------------------------------
+
+        st.subheader("Active Listings")
 
         show_cols = [
             "title",
@@ -1099,7 +1070,7 @@ def main() -> None:
             "item_web_url",
         ]
 
-        display_df = df[
+        display_df = active_df[
             show_cols
         ].copy()
 
@@ -1141,17 +1112,51 @@ def main() -> None:
         )
 
         # ---------------------------------------------------------------------
-        # CSV Export
+        # Active Export
         # ---------------------------------------------------------------------
 
-        csv_data = df.to_csv(
+        csv_data = active_df.to_csv(
             index=False
         ).encode("utf-8")
 
         st.download_button(
-            label="Download Results CSV",
+            label="Download Active Listings CSV",
             data=csv_data,
             file_name="ebay_active_listings.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+        # ---------------------------------------------------------------------
+        # Combined Metrics Export
+        # ---------------------------------------------------------------------
+
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "query": latest_query,
+                    "active_listings": metrics["active_count"],
+                    "sold_90d": metrics["sold_count"],
+                    "estimated_str": metrics["estimated_str"],
+                    "median_sold_price": metrics[
+                        "median_sold_price"
+                    ],
+                    "average_sold_price": metrics[
+                        "average_sold_price"
+                    ],
+                    "pick_score": pick_score,
+                }
+            ]
+        )
+
+        summary_csv = summary_df.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            label="Download Market Metrics CSV",
+            data=summary_csv,
+            file_name="ebay_market_metrics.csv",
             mime="text/csv",
             width="stretch",
         )
